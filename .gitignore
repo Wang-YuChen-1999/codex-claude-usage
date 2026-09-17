@@ -1,0 +1,11 @@
+# Build output
+dist/
+*.pdb
+build-log.txt
+
+# Local runtime snapshots and renders
+snapshot.json
+rendered_*.png
+
+# Third-party brand icons are not redistributed (see README)
+assets/

@@ -1,0 +1,7 @@
+{
+  "refreshSeconds": 60,
+  "warningPercent": 80,
+  "criticalPercent": 95,
+  "notificationsEnabled": true,
+  "codexExecutable": ""
+}
