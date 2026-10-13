@@ -41,19 +41,19 @@ namespace CodexClaudeUsage
         private const int PopupWidth = 516;
         private const int HeaderHeight = 70;
         private const int FooterHeight = 46;
-        private const int ProviderBandHeight = 48;
+        private const int ProviderBandHeight = 64;
         private const int CardMargin = 12;   // 卡片左右外距。
         private const int CardGap = 10;      // 標頭與卡片、卡片與卡片、卡片與頁腳的間距。
         private const int CardRadius = 8;
         private const int CardPadBottom = 8; // 卡片底部內距。
-        private const int ProviderHeaderHeight = 58; // 色帶 48 + 帶下 10 呼吸間距，避免首行標籤貼齊色塊
+        private const int ProviderHeaderHeight = 74; // 色帶下保留 10px 間距，讓首列額度不貼齊分隔線。
         private const int BucketHeight = 60;
         private const int MaxBucketsPerCard = 4; // Antigravity 有四個額度桶，卡片最多完整呈現四列。
 
         // 緊湊密度：三家供應商合計最多九列額度，標準間距在多數螢幕上會超出工作區。
         // 空間不足時整體改用較緊的垂直節奏（字級不變，只壓縮間距），先求「全部看得到」。
-        private const int CompactBandHeight = 40;
-        private const int CompactHeaderHeight = 48;
+        private const int CompactBandHeight = 56;
+        private const int CompactHeaderHeight = 64;
         private const int CompactBucketHeight = 50;
         private const int CompactCardGap = 8;
         private const int CompactCardPadBottom = 6;
@@ -670,6 +670,11 @@ namespace CodexClaudeUsage
                 codexUsed.HasValue ? Math.Round(100 - codexUsed.Value) + "%" : "--",
                 claudeUsed.HasValue ? Math.Round(100 - claudeUsed.Value) + "%" : "--",
                 antigravityUsed.HasValue ? Math.Round(100 - antigravityUsed.Value) + "%" : "--");
+            summary += Environment.NewLine + "本機最近工作階段：Codex "
+                + TokenUsageText.Short(_snapshot == null || _snapshot.Codex == null ? null : _snapshot.Codex.Tokens)
+                + " · Claude "
+                + TokenUsageText.Short(_snapshot == null || _snapshot.Claude == null ? null : _snapshot.Claude.Tokens)
+                + " · Antigravity Token 未提供";
             try
             {
                 Clipboard.SetText(summary);
@@ -828,8 +833,41 @@ namespace CodexClaudeUsage
                         status,
                         _statusFont,
                         statusBrush,
-                        new RectangleF(statusLeft, headerY + Px(_compact ? 2 : 4), statusWidth, Px(18)),
+                        new RectangleF(statusLeft, top + Px(_compact ? 8 : 11), statusWidth, Px(16)),
                         statusFormat);
+                    var tokenSupported = iconKind != BrandIconKind.Antigravity;
+                    var tokens = provider == null ? null : provider.Tokens;
+                    var metricTop = top + Px(_compact ? 35 : 41);
+                    var metricLeft = cardLeft + Px(16);
+                    var metricRight = cardRight - Px(16);
+                    using (var metricLabelBrush = new SolidBrush(Palette.MutedText))
+                    using (var metricValueBrush = new SolidBrush(tokens == null ? Palette.SecondaryText : Palette.PrimaryText))
+                    {
+                        using (var labelFormat = new StringFormat
+                        {
+                            Alignment = StringAlignment.Near,
+                            LineAlignment = StringAlignment.Center,
+                            Trimming = StringTrimming.EllipsisCharacter,
+                            FormatFlags = StringFormatFlags.NoWrap
+                        })
+                        {
+                            graphics.DrawString(
+                                TokenUsageText.Scope(tokens, tokenSupported),
+                                _detailFont,
+                                metricLabelBrush,
+                                new RectangleF(metricLeft, metricTop, Px(230), Px(18)),
+                                labelFormat);
+                        }
+                        graphics.DrawString(
+                            TokenUsageText.Value(tokens, tokenSupported),
+                            tokens == null ? _detailFont : _valueStrongFont,
+                            metricValueBrush,
+                            new RectangleF(metricRight - Px(205), metricTop, Px(205), Px(18)),
+                            statusFormat);
+                    }
+                    _hoverHints[-1 - (int)iconKind] = new KeyValuePair<Rectangle, string>(
+                        new Rectangle(metricLeft, metricTop - Px(2), metricRight - metricLeft, Px(22)),
+                        TokenUsageText.Detail(tokens, tokenSupported));
                     statusFormat.Dispose();
                 }
             }
@@ -905,6 +943,13 @@ namespace CodexClaudeUsage
             var used = Math.Max(0, Math.Min(100, animatedUsed));
             var remaining = Math.Max(0, 100 - used);
 
+            var exhaustText = bucket.ProjectedExhaustAt.HasValue
+                ? string.Format(CultureInfo.CurrentCulture, "約 {0:ddd HH:mm} 用罄", bucket.ProjectedExhaustAt.Value.ToLocalTime())
+                : string.Empty;
+            var detailLayout = CalculateBucketDetailLayout(
+                left, right, top, bucket.TrendPoints != null,
+                string.IsNullOrEmpty(exhaustText) ? 0 : MeasureSegment(graphics, exhaustText, _detailFont));
+
             var strongColor = used >= 95 ? Palette.Critical : used >= 80 ? Palette.Warning : Palette.PrimaryText;
             using (var labelBrush = new SolidBrush(Palette.PrimaryText))
             using (var valueStrongBrush = new SolidBrush(strongColor))
@@ -919,53 +964,79 @@ namespace CodexClaudeUsage
                     "\uE823",
                     Palette.MutedText,
                     new RectangleF(left, top + Px(RowGlyphY), Px(14), Px(16)));
-                graphics.DrawString(TimeUtil.ResetLabel(bucket), _detailFont, detailBrush, left + Px(19), top + Px(RowDetailY));
+                using (var format = new StringFormat
+                {
+                    Trimming = StringTrimming.EllipsisCharacter,
+                    FormatFlags = StringFormatFlags.NoWrap
+                })
+                {
+                    if (detailLayout.ResetBounds.Width > 0)
+                    {
+                        graphics.DrawString(TimeUtil.ResetLabel(bucket), _detailFont, detailBrush, detailLayout.ResetBounds, format);
+                    }
+                }
 
-                // 重設時間 hover 提示：顯示絕對時刻（推估值標註）。
-                if (bucket.ResetsAt.HasValue)
+                var hint = TimeUtil.ResetDetail(bucket);
+                if (!string.IsNullOrWhiteSpace(bucket.Detail))
                 {
-                    var hint = string.Format(
-                        CultureInfo.CurrentCulture,
-                        "重設於 {0:yyyy/MM/dd HH:mm}",
-                        bucket.ResetsAt.Value.ToLocalTime());
-                    if (bucket.ResetEstimate != ResetEstimateKind.None)
-                    {
-                        hint += "（推估）";
-                    }
-                    if (!string.IsNullOrWhiteSpace(bucket.Detail))
-                    {
-                        // 額度涵蓋的模型（例如 Gemini Flash, Gemini Pro）只在懸停時揭露，保持版面安靜。
-                        hint += " · " + bucket.Detail;
-                    }
-                    _hoverHints[top] = new KeyValuePair<Rectangle, string>(
-                        new Rectangle(left, top + Px(RowDetailY - 2), Px(250), Px(22)), hint);
+                    hint += " · " + bucket.Detail;
                 }
-                else
-                {
-                    _hoverHints.Remove(top);
-                }
+                _hoverHints[top] = new KeyValuePair<Rectangle, string>(
+                    new Rectangle(left, top + Px(RowDetailY - 2),
+                        Math.Max(0, (int)Math.Ceiling(detailLayout.ResetBounds.Right - left)), Px(22)), hint);
 
                 // \u6642\u9418\u884C\u53F3\u5074\uFF1A7 \u5929\u8DA8\u52E2\u8FF7\u4F60\u5716\u8207\u8017\u76E1\u9810\u8B66\uFF08\u50C5\u6BCF\u9031 bucket \u6703\u6709\u8CC7\u6599\uFF09\u3002
-                var infoRight = (float)right;
-                if (bucket.TrendPoints != null)
+                if (!detailLayout.SparkBounds.IsEmpty)
                 {
-                    var sparkBounds = new Rectangle(right - Px(88), top + Px(RowSparkY), Px(88), Px(13));
-                    DrawSparkline(graphics, sparkBounds, bucket.TrendPoints, accent);
-                    infoRight = sparkBounds.Left - Px(12);
+                    DrawSparkline(graphics, detailLayout.SparkBounds, bucket.TrendPoints, accent);
                 }
-                if (bucket.ProjectedExhaustAt.HasValue)
+                if (detailLayout.ExhaustBounds.Width > 0)
                 {
-                    var exhaustText = string.Format(
-                        CultureInfo.CurrentCulture,
-                        "\u7D04 {0:ddd HH:mm} \u7528\u7F44",
-                        bucket.ProjectedExhaustAt.Value.ToLocalTime());
                     using (var warnBrush = new SolidBrush(Palette.Warning))
+                    using (var format = new StringFormat(StringFormat.GenericTypographic)
                     {
-                        var textWidth = MeasureSegment(graphics, exhaustText, _detailFont);
-                        DrawSegment(graphics, exhaustText, _detailFont, warnBrush, infoRight - textWidth, top + Px(RowDetailY));
+                        Trimming = StringTrimming.EllipsisCharacter,
+                        FormatFlags = StringFormatFlags.NoWrap
+                    })
+                    {
+                        graphics.DrawString(exhaustText, _detailFont, warnBrush, detailLayout.ExhaustBounds, format);
                     }
                 }
             }
+        }
+
+        private struct BucketDetailLayout
+        {
+            public RectangleF ResetBounds;
+            public RectangleF ExhaustBounds;
+            public Rectangle SparkBounds;
+        }
+
+        private BucketDetailLayout CalculateBucketDetailLayout(int left, int right, int top, bool hasTrend, float exhaustWidth)
+        {
+            var layout = new BucketDetailLayout();
+            var resetLeft = Math.Min(right, left + Px(19));
+            var available = Math.Max(0, right - resetLeft);
+            var minimumResetWidth = Math.Min(Px(112), available);
+            var gap = Px(12);
+            var infoRight = (float)right;
+
+            // 先預留重設文字，避免窄視窗或高 DPI 下右側資訊覆蓋時間。
+            if (hasTrend && available >= minimumResetWidth + gap + Px(56))
+            {
+                var sparkWidth = Math.Min(Px(88), available - minimumResetWidth - gap);
+                layout.SparkBounds = new Rectangle(right - sparkWidth, top + Px(RowSparkY), sparkWidth, Px(13));
+                infoRight = layout.SparkBounds.Left - gap;
+            }
+            var maximumExhaustWidth = Math.Max(0, infoRight - resetLeft - minimumResetWidth - gap);
+            var visibleExhaustWidth = Math.Min(Math.Max(0, exhaustWidth), maximumExhaustWidth);
+            if (visibleExhaustWidth > 0)
+            {
+                layout.ExhaustBounds = new RectangleF(infoRight - visibleExhaustWidth, top + Px(RowDetailY), visibleExhaustWidth, Px(20));
+                infoRight = layout.ExhaustBounds.Left - gap;
+            }
+            layout.ResetBounds = new RectangleF(resetLeft, top + Px(RowDetailY), Math.Max(0, infoRight - resetLeft), Px(20));
+            return layout;
         }
 
         /// <summary>\u5B89\u975C\u7684 7 \u5929\u8DA8\u52E2\u6298\u7DDA\uFF1A\u534A\u900F\u660E\u54C1\u724C\u8272\u7D30\u7DDA\u52A0\u672B\u7AEF\u5BE6\u5FC3\u9EDE\uFF0C\u7121\u8EF8\u7DDA\u8207\u586B\u5145\u3002</summary>
@@ -1652,6 +1723,8 @@ namespace CodexClaudeUsage
                 return;
             }
             summary.Append(provider.Name).Append("。");
+            summary.Append(TokenUsageText.Detail(provider.Tokens,
+                !string.Equals(provider.Name, "Antigravity", StringComparison.OrdinalIgnoreCase))).Append("。");
             if (!provider.IsAvailable)
             {
                 summary.Append(string.IsNullOrWhiteSpace(provider.Error) ? "用量不可用。" : provider.Error + "。");

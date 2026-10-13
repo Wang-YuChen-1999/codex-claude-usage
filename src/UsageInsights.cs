@@ -65,7 +65,8 @@ namespace CodexClaudeUsage
                 Error = source.Error,
                 IsAvailable = source.IsAvailable,
                 UpdatedAt = source.UpdatedAt,
-                SourceKind = source.SourceKind
+                SourceKind = source.SourceKind,
+                Tokens = source.Tokens
             };
             var summary = SummaryBucket(source);
             if (summary != null)
@@ -91,6 +92,7 @@ namespace CodexClaudeUsage
         public double ExpectedUsedPercent { get; set; }
         public double PaceDeltaPercent { get; set; }
         public double DailyAllowancePercent { get; set; }
+        public bool HasPacing { get; set; }
         public bool IsFresh { get; set; }
         public string Status { get; set; }
     }
@@ -105,6 +107,7 @@ namespace CodexClaudeUsage
 
         public string Provider { get; set; }
         public DateTimeOffset ResetsAt { get; set; }
+        public UsageBucket Bucket { get; set; }
         public double RemainingPercent { get; set; }
         public bool IsFresh { get; set; }
         public string Status { get; set; }
@@ -192,7 +195,19 @@ namespace CodexClaudeUsage
                 return result;
             }
 
+            if (bucket.ResetEstimate == ResetEstimateKind.UpperBound && result.UsedPercent <= 0.05)
+            {
+                result.Status = "尚未開始計時";
+                return result;
+            }
+            if (result.ResetsAt.Value <= now)
+            {
+                result.Status = "等待重設同步";
+                return result;
+            }
+
             var duration = BucketDuration(bucket);
+            result.HasPacing = true;
             var cycleStart = result.ResetsAt.Value - duration;
             var elapsed = now - cycleStart;
             result.ExpectedUsedPercent = Clamp(100 * elapsed.TotalMilliseconds / duration.TotalMilliseconds);
@@ -254,6 +269,7 @@ namespace CodexClaudeUsage
                         ? name + " · " + bucket.Label
                         : name,
                     ResetsAt = bucket.ResetsAt.Value.ToUniversalTime(),
+                    Bucket = bucket,
                     RemainingPercent = 100 - used,
                     IsFresh = fresh,
                     Status = fresh
@@ -270,6 +286,10 @@ namespace CodexClaudeUsage
             {
                 return "尚未開始計時";
             }
+            if (bucket.ResetsAt.Value.ToUniversalTime() <= now)
+            {
+                return "等待重設同步";
+            }
             var duration = BucketDuration(bucket);
             if (duration <= TimeSpan.Zero)
             {
@@ -283,7 +303,7 @@ namespace CodexClaudeUsage
 
         private static string Recommend(ProviderInsight codex, ProviderInsight claude, ProviderInsight antigravity)
         {
-            var list = new[] { codex, claude, antigravity }.Where(p => p != null && p.IsFresh).ToList();
+            var list = new[] { codex, claude, antigravity }.Where(p => p != null && p.IsFresh && p.HasPacing).ToList();
             if (list.Count == 0)
             {
                 return string.Empty;

@@ -7,5 +7,35 @@ build-log.txt
 snapshot.json
 rendered_*.png
 
-# Third-party brand icons are not redistributed (see README)
-assets/
+# Local credentials and runtime data
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+auth.json
+credentials.json
+.credentials.json
+claude-status.json
+antigravity-status.json
+codex-reset-state.json
+notification-state.json
+preferences.json
+widget-state.json
+*usage-history.json
+*cycle-history.json
+*analytics-index.bin
+*budget-state.json
+*.log
+*.log.old
+*.tmp
+*.zip
+
+# Personal records and captures; only synthetic demos are published
+Claude outputs/
+docs/*snapshot*.json
+docs/*.png
+!docs/demo-*.png
+docs/references/
+docs/widget-paint-recovery/
+.vs/

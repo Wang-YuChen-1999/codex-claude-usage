@@ -65,6 +65,7 @@ namespace CodexClaudeUsage
         public bool IsAvailable { get; set; }
         public DateTimeOffset UpdatedAt { get; set; }
         public UsageSourceKind SourceKind { get; set; }
+        public LocalTokenUsage Tokens { get; set; }
         public List<UsageBucket> Buckets { get; private set; }
     }
 
@@ -82,6 +83,76 @@ namespace CodexClaudeUsage
         public ProviderSnapshot Claude { get; set; }
         public ProviderSnapshot Antigravity { get; set; }
         public DateTimeOffset UpdatedAt { get; set; }
+    }
+
+    internal static class TokenUsageText
+    {
+        public static string Scope(LocalTokenUsage tokens, bool supported)
+        {
+            if (!supported)
+            {
+                return "Token 計數";
+            }
+            if (tokens == null)
+            {
+                return "本機最近工作階段";
+            }
+            return tokens.UpdatedAt.ToLocalTime().Date == DateTimeOffset.Now.Date
+                ? "本機最近工作階段 · 今日更新"
+                : "本機歷史工作階段 · " + DateLabel(tokens);
+        }
+
+        public static string Value(LocalTokenUsage tokens, bool supported)
+        {
+            if (!supported)
+            {
+                return "來源未提供";
+            }
+            if (tokens == null)
+            {
+                return "暫無完整紀錄";
+            }
+            return tokens.TotalTokens.ToString("N0", CultureInfo.CurrentCulture) + " Token";
+        }
+
+        public static string Short(LocalTokenUsage tokens)
+        {
+            return tokens == null
+                ? "Token 未提供"
+                : Value(tokens, true) + " · " + Scope(tokens, true);
+        }
+
+        public static string Compact(LocalTokenUsage tokens)
+        {
+            return Scope(tokens, true) + " · " + Value(tokens, true);
+        }
+
+        private static string DateLabel(LocalTokenUsage tokens)
+        {
+            var local = tokens.UpdatedAt.ToLocalTime();
+            if (local.Date == DateTimeOffset.Now.Date)
+            {
+                return "今日";
+            }
+            return local.Year == DateTimeOffset.Now.Year
+                ? local.ToString("MM/dd", CultureInfo.CurrentCulture)
+                : local.ToString("yyyy/MM/dd", CultureInfo.CurrentCulture);
+        }
+
+        public static string Detail(LocalTokenUsage tokens, bool supported = true)
+        {
+            if (!supported)
+            {
+                return "此資料來源未提供可驗證的 Token 計數。";
+            }
+            if (tokens == null)
+            {
+                return "本機最近工作階段暫無完整 Token 紀錄。";
+            }
+            return string.Format(CultureInfo.CurrentCulture,
+                "本機最近工作階段：輸入（含快取）{0:N0}、輸出 {1:N0}，合計 {2:N0} Token；紀錄於 {3:yyyy/MM/dd HH:mm}。這是單一工作階段累積值，不是今日或本週消耗；Token 紀錄時間與方案額度更新時間分開計算。不含其他工作階段與裝置使用量，也不代表帳號額度。",
+                tokens.InputTokens, tokens.OutputTokens, tokens.TotalTokens, tokens.UpdatedAt.ToLocalTime());
+        }
     }
 
     internal sealed class AppConfig
@@ -338,10 +409,10 @@ namespace CodexClaudeUsage
             }
             if (bucket.ResetEstimate == ResetEstimateKind.UpperBound)
             {
-                return string.Format(
-                    CultureInfo.CurrentCulture,
-                    "{0:ddd HH:mm} 前重設 · 推估",
-                    bucket.ResetsAt.Value.ToLocalTime());
+                if (bucket.UsedPercent <= 0.05) return "尚未開始計時";
+                if (bucket.ResetsAt.Value <= DateTimeOffset.Now)
+                    return "推估時間已到 · 等待同步";
+                return ResetClock(bucket.ResetsAt.Value) + " 前重設 · 推估";
             }
             var label = ResetLabel(bucket.ResetsAt);
             return bucket.ResetEstimate == ResetEstimateKind.Cycle ? label + " · 推估" : label;
@@ -360,7 +431,7 @@ namespace CodexClaudeUsage
             string relative;
             if (delta.TotalMinutes <= 0)
             {
-                relative = "即將重設";
+                relative = "已到時間 · 等待同步";
             }
             else if (delta.TotalHours < 1)
             {
@@ -375,7 +446,29 @@ namespace CodexClaudeUsage
                 relative = string.Format(CultureInfo.CurrentCulture, "約 {0} 天後", (int)Math.Ceiling(delta.TotalDays));
             }
 
-            return string.Format(CultureInfo.CurrentCulture, "{0:ddd HH:mm} · {1}", local, relative);
+            return ResetClock(local) + " · " + relative;
+        }
+
+        public static string ResetDetail(UsageBucket bucket)
+        {
+            if (bucket == null || !bucket.ResetsAt.HasValue)
+                return "來源未提供有效的重設時間，等待下一次資料同步；不代表額度已重設。";
+            var time = bucket.ResetsAt.Value.ToLocalTime().ToString("yyyy/MM/dd ddd HH:mm", CultureInfo.CurrentCulture);
+            if (bucket.ResetEstimate == ResetEstimateKind.UpperBound && bucket.UsedPercent <= 0.05)
+                return "尚未開始計時；來源回報的推估上界為 " + time + "，不是已啟動的固定倒數。";
+            if (bucket.ResetsAt.Value <= DateTimeOffset.Now)
+                return "原" + (bucket.ResetEstimate == ResetEstimateKind.None ? "回報" : "推估") + "重設時間 " + time
+                    + " 已到，等待來源同步確認；目前仍保留最後回報的用量。";
+            if (bucket.ResetEstimate == ResetEstimateKind.UpperBound)
+                return "最晚於 " + time + " 重設（推估上界，並非確定時間）。";
+            return "重設於 " + time + (bucket.ResetEstimate == ResetEstimateKind.Cycle ? "（依週期推估）。" : "（來源回報）。");
+        }
+
+        private static string ResetClock(DateTimeOffset timestamp)
+        {
+            var local = timestamp.ToLocalTime();
+            var format = local.Year == DateTimeOffset.Now.Year ? "MM/dd ddd HH:mm" : "yyyy/MM/dd ddd HH:mm";
+            return local.ToString(format, CultureInfo.CurrentCulture);
         }
 
         public static string FreshnessLabel(DateTimeOffset timestamp)

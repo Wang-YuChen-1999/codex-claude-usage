@@ -29,18 +29,8 @@ $output = Join-Path $outputDirectory 'CodexClaudeUsage.exe'
 $codexIcon = Join-Path $root 'assets\codex-native.ico'
 $claudeIcon = Join-Path $root 'assets\claude-native.ico'
 $antigravityIcon = Join-Path $root 'assets\antigravity-native.ico'
-# 第三方品牌圖示不隨開源版本散佈；assets\ 內有對應檔案才嵌入，
-# 否則執行時改用本機已安裝 App 的圖示，或以品牌色圓形字母繪製。
-$iconArguments = @()
-if (Test-Path -LiteralPath $codexIcon) {
-    $iconArguments += "/win32icon:$codexIcon"
-    $iconArguments += "/resource:$codexIcon,CodexClaudeUsage.Assets.codex-native.ico"
-}
-if (Test-Path -LiteralPath $claudeIcon) {
-    $iconArguments += "/resource:$claudeIcon,CodexClaudeUsage.Assets.claude-native.ico"
-}
-if (Test-Path -LiteralPath $antigravityIcon) {
-    $iconArguments += "/resource:$antigravityIcon,CodexClaudeUsage.Assets.antigravity-native.ico"
+if (-not (Test-Path -LiteralPath $codexIcon) -or -not (Test-Path -LiteralPath $claudeIcon) -or -not (Test-Path -LiteralPath $antigravityIcon)) {
+    throw '缺少 Codex、Claude 或 Antigravity 原生圖示資產。'
 }
 $sources = Get-ChildItem -LiteralPath $sourceDirectory -Filter '*.cs' -File |
     Sort-Object Name |
@@ -53,13 +43,18 @@ $arguments = @(
     '/optimize+',
     '/debug:pdbonly',
     "/out:$output",
+    "/win32icon:$codexIcon",
     "/win32manifest:$(Join-Path $root 'app.manifest')",
     '/reference:System.dll',
     '/reference:System.Core.dll',
     '/reference:System.Drawing.dll',
+    '/reference:System.Management.dll',
     '/reference:System.Windows.Forms.dll',
-    '/reference:System.Web.Extensions.dll'
-) + $iconArguments + $sources
+    '/reference:System.Web.Extensions.dll',
+    "/resource:$codexIcon,CodexClaudeUsage.Assets.codex-native.ico",
+    "/resource:$claudeIcon,CodexClaudeUsage.Assets.claude-native.ico",
+    "/resource:$antigravityIcon,CodexClaudeUsage.Assets.antigravity-native.ico"
+) + $sources
 
 & $compiler @arguments
 if ($LASTEXITCODE -ne 0) {

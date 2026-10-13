@@ -30,6 +30,7 @@ namespace CodexClaudeUsage
         private readonly Panel _historyPage;
         private readonly Panel _healthPage;
         private readonly Panel _settingsPage;
+        private readonly TokenAnalyticsPanel _tokenAnalyticsPage;
         private readonly ProviderUsageRow _codexRow;
         private readonly ProviderUsageRow _claudeRow;
         private readonly ProviderUsageRow _antigravityRow;
@@ -89,8 +90,8 @@ namespace CodexClaudeUsage
             Controls.Add(root);
 
             _tabs = new CenterNavigation(_scale,
-                new[] { "總覽", "歷史", "健康", "設定" },
-                new[] { "\uE80F", "\uE81C", "\uE9D9", "\uE713" })
+                new[] { "總覽", "歷史", "健康", "設定", "Token 分析" },
+                new[] { "\uE80F", "\uE81C", "\uE9D9", "\uE713", "\uE9D2" })
             {
                 Dock = DockStyle.Fill
             };
@@ -130,16 +131,23 @@ namespace CodexClaudeUsage
             _historyPage = CreatePage();
             _healthPage = CreatePage();
             _settingsPage = CreatePage();
-            _pages = new Control[] { _overviewPage, _historyPage, _healthPage, _settingsPage };
+            _tokenAnalyticsPage = new TokenAnalyticsPanel(_scale, _preferences) { Dock = DockStyle.Fill };
+            _tokenAnalyticsPage.PreferencesChanged += delegate { Raise(PreferencesChanged); };
+            _tokenAnalyticsPage.ExportCsvRequested += delegate(List<TokenUsageEntry> rows)
+            {
+                var handler = ExportTokensCsvRequested;
+                if (handler != null) handler(rows);
+            };
+            _pages = new Control[] { _overviewPage, _historyPage, _healthPage, _settingsPage, _tokenAnalyticsPage };
             foreach (var page in _pages)
             {
                 page.Visible = false;
                 _contentHost.Controls.Add(page);
             }
 
-            _codexRow = new ProviderUsageRow(BrandIconKind.Codex, "Codex", Palette.Codex, _scale) { Dock = DockStyle.Top, Height = Px(82) };
-            _claudeRow = new ProviderUsageRow(BrandIconKind.Claude, "Claude Code", Palette.Claude, _scale) { Dock = DockStyle.Top, Height = Px(82) };
-            _antigravityRow = new ProviderUsageRow(BrandIconKind.Antigravity, "Antigravity", Palette.Antigravity, _scale) { Dock = DockStyle.Top, Height = Px(82) };
+            _codexRow = new ProviderUsageRow(BrandIconKind.Codex, "Codex", Palette.Codex, _scale) { Dock = DockStyle.Top, Height = Px(94) };
+            _claudeRow = new ProviderUsageRow(BrandIconKind.Claude, "Claude Code", Palette.Claude, _scale) { Dock = DockStyle.Top, Height = Px(94) };
+            _antigravityRow = new ProviderUsageRow(BrandIconKind.Antigravity, "Antigravity", Palette.Antigravity, _scale) { Dock = DockStyle.Top, Height = Px(94) };
             _recommendation = CreateBandLabel();
             var timeline = CreateListView("模型", "下一次重設", "狀態");
             timeline.BackColor = Palette.Background;
@@ -175,6 +183,12 @@ namespace CodexClaudeUsage
         public event EventHandler ExportHistoryCsvRequested;
         public event EventHandler ExportHistoryJsonRequested;
         public event EventHandler RepairBridgeRequested;
+        public event Action<List<TokenUsageEntry>> ExportTokensCsvRequested;
+
+        public void SetTokenAnalytics(TokenAnalyticsSnapshot snapshot)
+        {
+            _tokenAnalyticsPage.SetSnapshot(snapshot);
+        }
 
         public void ReloadPreferences()
         {
@@ -192,6 +206,7 @@ namespace CodexClaudeUsage
             if (_retention.SelectedIndex < 0) _retention.SelectedIndex = 3;
             _hotkeys.Checked = _preferences.GlobalHotkeysEnabled;
             UpdateQuietHoursState();
+            _tokenAnalyticsPage.ReloadPreferences();
         }
 
         public void SetSnapshot(
@@ -206,6 +221,9 @@ namespace CodexClaudeUsage
                 _codexRow.SetProvider(snapshot.Codex);
                 _claudeRow.SetProvider(snapshot.Claude);
                 _antigravityRow.SetProvider(snapshot.Antigravity);
+                _toolTip.SetToolTip(_codexRow, TokenUsageText.Detail(snapshot.Codex == null ? null : snapshot.Codex.Tokens));
+                _toolTip.SetToolTip(_claudeRow, TokenUsageText.Detail(snapshot.Claude == null ? null : snapshot.Claude.Tokens));
+                _toolTip.SetToolTip(_antigravityRow, TokenUsageText.Detail(null, false));
                 SetStatus("更新於 " + FormatTimestamp(snapshot.UpdatedAt));
             }
 
@@ -263,7 +281,7 @@ namespace CodexClaudeUsage
             if ((keyData & Keys.Control) == Keys.Control)
             {
                 var key = keyData & Keys.KeyCode;
-                if (key >= Keys.D1 && key <= Keys.D4)
+                if (key >= Keys.D1 && key <= Keys.D5)
                 {
                     SelectTab((int)key - (int)Keys.D1);
                     return true;
@@ -415,13 +433,14 @@ namespace CodexClaudeUsage
             }
             _pages[index].BringToFront();
 
-            var titles = new[] { "用量總覽", "週期歷史", "資料健康", "偏好設定" };
+            var titles = new[] { "用量總覽", "週期歷史", "資料健康", "偏好設定", "Token 分析" };
             var details = new[]
             {
                 "配額、消耗節奏與下一次重設",
                 "比較近期週期與每日平均用量",
                 "確認資料來源、更新時間與橋接狀態",
-                "控制顯示方式、通知與本機紀錄"
+                "控制顯示方式、通知與本機紀錄",
+                "本機累計、模型與專案消耗"
             };
             if (_pageTitle != null) _pageTitle.Text = titles[index];
             if (_pageDetail != null) _pageDetail.Text = details[index];
@@ -431,7 +450,7 @@ namespace CodexClaudeUsage
         {
             var layout = new TableLayoutPanel
             {
-                Dock = DockStyle.Fill,
+                Dock = DockStyle.Top,
                 ColumnCount = 1,
                 RowCount = 7,
                 BackColor = Palette.Background,
@@ -441,15 +460,15 @@ namespace CodexClaudeUsage
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(38)));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(42)));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(84)));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(84)));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(84)));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(100)));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(100)));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(100)));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(48)));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             _recommendation.Dock = DockStyle.Fill;
             _recommendation.Margin = new Padding(0, 0, 0, Px(6));
             layout.Controls.Add(_recommendation, 0, 0);
-            layout.Controls.Add(CreateSectionHeading("目前用量", "每週模型總量與使用節奏"), 0, 1);
+            layout.Controls.Add(CreateSectionHeading("目前用量", "每週模型總量 · Token 為本機最近工作階段"), 0, 1);
             _codexRow.Dock = DockStyle.Fill;
             _codexRow.Margin = new Padding(0, 0, 0, Px(6));
             layout.Controls.Add(_codexRow, 0, 2);
@@ -463,7 +482,13 @@ namespace CodexClaudeUsage
             heading.Margin = new Padding(0, Px(4), 0, 0);
             layout.Controls.Add(heading, 0, 5);
             layout.Controls.Add(_timeline, 0, 6);
+            _overviewPage.AutoScroll = true;
             _overviewPage.Controls.Add(layout);
+            _overviewPage.Resize += delegate
+            {
+                layout.Height = Math.Max(Px(500), _overviewPage.ClientSize.Height);
+            };
+            layout.Height = Math.Max(Px(500), _overviewPage.ClientSize.Height);
         }
 
         private void BuildHistory()
@@ -637,7 +662,9 @@ namespace CodexClaudeUsage
                 foreach (var timelineItem in insights.Timeline)
                 {
                     var item = new ListViewItem(timelineItem.Provider);
-                    item.SubItems.Add(TimeUtil.ResetLabel(timelineItem.ResetsAt));
+                    item.SubItems.Add(timelineItem.Bucket == null
+                        ? TimeUtil.ResetLabel(timelineItem.ResetsAt)
+                        : TimeUtil.ResetLabel(timelineItem.Bucket));
                     item.SubItems.Add(string.Format(
                         CultureInfo.CurrentCulture,
                         "剩餘 {0:0}% · {1}",
@@ -1250,7 +1277,7 @@ namespace CodexClaudeUsage
             }
         }
 
-        private sealed class ProfessionalListView : ListView
+        internal sealed class ProfessionalListView : ListView
         {
             private const int WmPaint = 0x000F;
             private const int WmPrint = 0x0317;
@@ -1261,6 +1288,7 @@ namespace CodexClaudeUsage
             private readonly Font _bodyFont;
             private readonly Font _strongFont;
             private readonly ImageList _rowHeight;
+            private HeaderRemainderWindow _headerRemainder;
 
             public ProfessionalListView(float scale, int[] weights)
             {
@@ -1288,12 +1316,13 @@ namespace CodexClaudeUsage
             }
 
             public Color EmptyAreaColor { get; set; }
+            public int RightColumnInset { get; set; }
 
             public void ReflowColumns()
             {
                 if (Columns.Count == 0 || ClientSize.Width <= 0) return;
                 var dataColumnCount = Math.Min(_weights.Length, Columns.Count);
-                var available = Math.Max(Px(120), ClientSize.Width);
+                var available = Math.Max(Px(120), ClientSize.Width - RightColumnInset);
                 var totalWeight = Math.Max(1, _weights.Sum());
                 var assigned = 0;
                 for (var index = 0; index < dataColumnCount; index++)
@@ -1304,6 +1333,8 @@ namespace CodexClaudeUsage
                     Columns[index].Width = width;
                     assigned += width;
                 }
+                if (RightColumnInset > 0 && IsHandleCreated && assigned < ClientSize.Width)
+                    NativeControlTheme.HideHorizontalScroll(Handle);
             }
 
             protected override void OnHandleCreated(EventArgs e)
@@ -1311,6 +1342,17 @@ namespace CodexClaudeUsage
                 base.OnHandleCreated(e);
                 NativeControlTheme.ApplyDark(Handle);
                 NativeControlTheme.ApplyDark(NativeControlTheme.GetListHeader(Handle));
+                if (RightColumnInset > 0)
+                {
+                    var header = NativeControlTheme.GetListHeader(Handle);
+                    if (header != IntPtr.Zero) _headerRemainder = new HeaderRemainderWindow(this, header);
+                }
+            }
+
+            protected override void OnHandleDestroyed(EventArgs e)
+            {
+                if (_headerRemainder != null) { _headerRemainder.ReleaseHandle(); _headerRemainder = null; }
+                base.OnHandleDestroyed(e);
             }
 
             protected override void OnResize(EventArgs e)
@@ -1375,6 +1417,9 @@ namespace CodexClaudeUsage
             {
                 base.WndProc(ref message);
                 if (!IsHandleCreated || SystemInformation.HighContrast) return;
+                if (RightColumnInset > 0 && (message.Msg == WmPaint || message.Msg == WmPrint || message.Msg == WmPrintClient) &&
+                    Columns.Cast<ColumnHeader>().Sum(column => column.Width) < ClientSize.Width)
+                    NativeControlTheme.HideHorizontalScroll(Handle);
                 if (message.Msg == WmPaint)
                 {
                     using (var graphics = Graphics.FromHwnd(Handle)) PaintUnusedArea(graphics);
@@ -1395,6 +1440,37 @@ namespace CodexClaudeUsage
                     _rowHeight.Dispose();
                 }
                 base.Dispose(disposing);
+            }
+
+            private sealed class HeaderRemainderWindow : NativeWindow
+            {
+                private readonly ProfessionalListView _owner;
+                public HeaderRemainderWindow(ProfessionalListView owner, IntPtr handle)
+                {
+                    _owner = owner;
+                    AssignHandle(handle);
+                }
+                protected override void WndProc(ref Message message)
+                {
+                    base.WndProc(ref message);
+                    if (Handle == IntPtr.Zero || SystemInformation.HighContrast) return;
+                    if (message.Msg == WmPaint)
+                    {
+                        using (var graphics = Graphics.FromHwnd(Handle)) PaintRemainder(graphics);
+                    }
+                    else if ((message.Msg == WmPrint || message.Msg == WmPrintClient) && message.WParam != IntPtr.Zero)
+                    {
+                        using (var graphics = Graphics.FromHdc(message.WParam)) PaintRemainder(graphics);
+                    }
+                }
+                private void PaintRemainder(Graphics graphics)
+                {
+                    var left = _owner.Columns.Cast<ColumnHeader>().Sum(column => column.Width);
+                    var width = _owner.ClientSize.Width - left;
+                    if (width <= 0) return;
+                    using (var brush = new SolidBrush(Palette.SurfaceRaised))
+                        graphics.FillRectangle(brush, left, 0, width, _owner.Px(34));
+                }
             }
 
             private static Color SemanticTextColor(string text, bool selected)
@@ -1506,7 +1582,7 @@ namespace CodexClaudeUsage
             }
         }
 
-        private sealed class DarkComboBox : ComboBox
+        internal sealed class DarkComboBox : ComboBox
         {
             private const int WmPaint = 0x000F;
             private const int WmPrint = 0x0317;
@@ -1530,6 +1606,8 @@ namespace CodexClaudeUsage
                 IntegralHeight = false;
                 DropDownHeight = Px(220);
             }
+
+            public bool PaintSelectionSurface { get; set; }
 
             protected override void OnHandleCreated(EventArgs e)
             {
@@ -1558,11 +1636,11 @@ namespace CodexClaudeUsage
                 if (!IsHandleCreated) return;
                 if (message.Msg == WmPaint)
                 {
-                    using (var graphics = Graphics.FromHwnd(Handle)) PaintDropButton(graphics);
+                    using (var graphics = Graphics.FromHwnd(Handle)) PaintClosedSurface(graphics);
                 }
                 else if ((message.Msg == WmPrint || message.Msg == WmPrintClient) && message.WParam != IntPtr.Zero)
                 {
-                    using (var graphics = Graphics.FromHdc(message.WParam)) PaintDropButton(graphics);
+                    using (var graphics = Graphics.FromHdc(message.WParam)) PaintClosedSurface(graphics);
                 }
             }
 
@@ -1573,9 +1651,22 @@ namespace CodexClaudeUsage
                 base.Dispose(disposing);
             }
 
-            private void PaintDropButton(Graphics graphics)
+            private void PaintClosedSurface(Graphics graphics)
             {
                 var width = Px(21);
+                if (PaintSelectionSurface && !SystemInformation.HighContrast)
+                {
+                    var selection = new Rectangle(1, 1, Math.Max(1, ClientSize.Width - width - 1), Math.Max(1, ClientSize.Height - 2));
+                    using (var background = new SolidBrush(Enabled ? Palette.SurfaceRaised : Palette.Surface))
+                        graphics.FillRectangle(background, selection);
+                    var textBounds = Rectangle.Inflate(selection, -Px(7), 0);
+                    TextRenderer.DrawText(graphics, SelectedItem == null ? string.Empty : GetItemText(SelectedItem), _itemFont,
+                        textBounds, Enabled ? Palette.PrimaryText : Palette.MutedText,
+                        TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+                    if (Focused && ShowFocusCues) ControlPaint.DrawFocusRectangle(graphics, Rectangle.Inflate(selection, -Px(2), -Px(2)), Palette.SecondaryText, Palette.SurfaceRaised);
+                    using (var border = new Pen(Focused ? Palette.Focus : Palette.BorderStrong))
+                        graphics.DrawRectangle(border, 0, 0, Math.Max(0, ClientSize.Width - 1), Math.Max(0, ClientSize.Height - 1));
+                }
                 var bounds = new Rectangle(Math.Max(0, ClientSize.Width - width), 1, width - 1, Math.Max(1, ClientSize.Height - 2));
                 using (var background = new SolidBrush(Enabled ? Palette.SurfaceRaised : Palette.Surface))
                 using (var divider = new Pen(Palette.BorderStrong))
@@ -1610,6 +1701,21 @@ namespace CodexClaudeUsage
                 try { return SendMessage(listHandle, LvmGetHeader, IntPtr.Zero, IntPtr.Zero); } catch { return IntPtr.Zero; }
             }
 
+            public static void HideHorizontalScroll(IntPtr handle)
+            {
+                if (handle == IntPtr.Zero) return;
+                try
+                {
+                    if ((GetWindowLong(handle, -16) & 0x00100000) != 0) ShowScrollBar(handle, 0, false);
+                }
+                catch { }
+            }
+
+            [DllImport("user32.dll")]
+            private static extern int GetWindowLong(IntPtr handle, int index);
+            [DllImport("user32.dll")]
+            private static extern bool ShowScrollBar(IntPtr handle, int bar, bool show);
+
             [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
             private static extern int SetWindowTheme(IntPtr handle, string subAppName, string subIdList);
 
@@ -1627,6 +1733,7 @@ namespace CodexClaudeUsage
             private readonly Font _valueFont;
             private readonly Font _labelFont;
             private readonly Font _detailFont;
+            private readonly Font _tokenValueFont;
             private ProviderSnapshot _provider;
             private ProviderInsight _insight;
 
@@ -1640,6 +1747,7 @@ namespace CodexClaudeUsage
                 _valueFont = NativeVisuals.CreateValueFont(11f, FontStyle.Bold);
                 _labelFont = NativeVisuals.CreateUiFont(8.75f, FontStyle.Regular);
                 _detailFont = NativeVisuals.CreateUiFont(8.25f, FontStyle.Regular);
+                _tokenValueFont = NativeVisuals.CreateValueFont(9.25f, FontStyle.Bold);
                 BackColor = Palette.Background;
                 ForeColor = Palette.PrimaryText;
                 DoubleBuffered = true;
@@ -1716,21 +1824,37 @@ namespace CodexClaudeUsage
                             e.Graphics.FillPath(fill, fillPath);
                         }
                     }
-                    var reset = _insight != null
-                        ? TimeUtil.ResetLabel(_insight.ResetsAt)
-                        : (bucket == null ? "重設時間未知" : TimeUtil.ResetLabel(bucket));
+                    var reset = bucket != null
+                        ? TimeUtil.ResetLabel(bucket)
+                        : TimeUtil.ResetLabel(_insight == null ? null : _insight.ResetsAt);
                     var pace = _insight != null
-                        ? (_insight.IsFresh
+                        ? (_insight.HasPacing
                             ? string.Format(CultureInfo.CurrentCulture, "{0} · 每日 {1:0.0}%", _insight.Status, _insight.DailyAllowancePercent)
                             : _insight.Status)
                         : (bucket == null ? "節奏未知" : PaceText(bucket));
                     var resetWidth = Math.Max(Px(90), (contentRight - contentLeft) * 3 / 5);
                     TextRenderer.DrawText(e.Graphics, reset, _detailFont,
-                        new Rectangle(contentLeft, Px(57), resetWidth, Px(19)), Palette.MutedText,
+                        new Rectangle(contentLeft, Px(54), resetWidth, Px(19)), Palette.MutedText,
                         TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
                     TextRenderer.DrawText(e.Graphics, pace, _detailFont,
-                        new Rectangle(contentLeft + resetWidth, Px(57), Math.Max(Px(30), contentRight - contentLeft - resetWidth), Px(19)), Palette.MutedText,
+                        new Rectangle(contentLeft + resetWidth, Px(54), Math.Max(Px(30), contentRight - contentLeft - resetWidth), Px(19)), Palette.MutedText,
                         TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+
+                    var tokenSupported = _icon != BrandIconKind.Antigravity;
+                    var tokens = _provider == null ? null : _provider.Tokens;
+                    var tokenValue = TokenUsageText.Value(tokens, tokenSupported);
+                    var tokenFont = tokens == null ? _detailFont : _tokenValueFont;
+                    var tokenValueWidth = Math.Min(contentRight - contentLeft,
+                        TextRenderer.MeasureText(tokenValue, tokenFont, Size.Empty, TextFormatFlags.NoPadding).Width);
+                    var tokenValueLeft = contentRight - tokenValueWidth;
+                    TextRenderer.DrawText(e.Graphics, TokenUsageText.Scope(tokens, tokenSupported), _detailFont,
+                        new Rectangle(contentLeft, Px(74), Math.Max(Px(20), tokenValueLeft - contentLeft - Px(10)), Px(18)),
+                        Palette.MutedText,
+                        TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+                    TextRenderer.DrawText(e.Graphics, tokenValue, tokenFont,
+                        new Rectangle(tokenValueLeft, Px(74), tokenValueWidth, Px(18)),
+                        tokens == null ? Palette.SecondaryText : Palette.PrimaryText,
+                        TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
                 }
                 using (var divider = new Pen(Palette.Border))
                 {
@@ -1745,6 +1869,7 @@ namespace CodexClaudeUsage
                     _valueFont.Dispose();
                     _labelFont.Dispose();
                     _detailFont.Dispose();
+                    _tokenValueFont.Dispose();
                 }
                 base.Dispose(disposing);
             }
@@ -1755,9 +1880,12 @@ namespace CodexClaudeUsage
                 var used = _insight == null
                     ? (bucket == null ? 0 : bucket.UsedPercent)
                     : _insight.UsedPercent;
+                var tokenDetail = TokenUsageText.Detail(_provider == null ? null : _provider.Tokens,
+                    _icon != BrandIconKind.Antigravity);
                 AccessibleDescription = bucket == null && _insight == null
-                    ? _name + " 等待資料"
-                    : string.Format(CultureInfo.CurrentCulture, "{0} 已用 {1:0}%，剩餘 {2:0}%", _name, used, Math.Max(0, 100 - used));
+                    ? _name + " 等待額度資料。" + tokenDetail
+                    : string.Format(CultureInfo.CurrentCulture, "{0} 已用 {1:0}%，剩餘 {2:0}%。{3}",
+                        _name, used, Math.Max(0, 100 - used), tokenDetail);
             }
 
             private int Px(int value)
@@ -1767,6 +1895,10 @@ namespace CodexClaudeUsage
 
             private static string PaceText(UsageBucket bucket)
             {
+                if (bucket.ResetEstimate == ResetEstimateKind.UpperBound && bucket.UsedPercent <= 0.05)
+                    return "尚未開始計時";
+                if (!bucket.ResetsAt.HasValue) return "節奏未知";
+                if (bucket.ResetsAt.Value <= DateTimeOffset.UtcNow) return "等待重設同步";
                 if (bucket.ProjectedExhaustAt.HasValue) return "消耗偏快";
                 if (bucket.WindowDurationMinutes >= 1440)
                 {

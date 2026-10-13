@@ -30,13 +30,25 @@ namespace CodexClaudeUsage
         private readonly UsagePopup _popup;
         private readonly UsageCenterForm _center;
         private readonly WidgetState _widgetState;
-        private readonly DesktopWidget _widget;
+        private DesktopWidget _widget;
         private readonly ToolStripMenuItem _widgetItem;
         private readonly NotifyIcon _trayIcon;
         private Icon _ownedIcon;
         private readonly ContextMenuStrip _menu;
         private readonly System.Windows.Forms.Timer _menuCommandTimer;
         private readonly System.Windows.Forms.Timer _timer;
+        private readonly System.Windows.Forms.Timer _tokenTimer;
+        private readonly System.Windows.Forms.Timer _claudeLiveTimer;
+        private readonly ClaudeUsageMonitor _claudeMonitor;
+        private readonly System.Windows.Forms.Timer _widgetRecoveryTimer;
+        private readonly UsageRecoveryPolicy _recovery = new UsageRecoveryPolicy();
+        private readonly TokenBudgetMonitor _tokenBudget = new TokenBudgetMonitor();
+        private readonly CancellationTokenSource _tokenCancellation = new CancellationTokenSource();
+        private TokenAnalyticsReader _tokenReader;
+        private TokenAnalyticsSnapshot _latestTokens;
+        private bool _isRefreshingTokens;
+        private bool _shuttingDown;
+        private DateTimeOffset _lastWidgetRecovery = DateTimeOffset.MinValue;
         private readonly ToolStripMenuItem _openItem;
         private readonly ToolStripMenuItem _centerItem;
         private readonly ToolStripMenuItem _refreshItem;
@@ -76,21 +88,11 @@ namespace CodexClaudeUsage
             _center.ExportDiagnosticsRequested += delegate { CopyDiagnostics(); };
             _center.ExportHistoryCsvRequested += delegate { ExportHistory(false); };
             _center.ExportHistoryJsonRequested += delegate { ExportHistory(true); };
+            _center.ExportTokensCsvRequested += ExportTokens;
             _center.RepairBridgeRequested += delegate { RepairClaudeBridge(); };
 
             _widgetState = WidgetState.Load();
-            _widget = new DesktopWidget(_widgetState);
-            _widget.OpenAtRequested += delegate(Point landing) { _popup.ShowLiquidReveal(landing); };
-            _widget.RefreshRequested += delegate { RefreshUsage(); };
-            _widget.HiddenByUser += delegate
-            {
-                _widgetState.Enabled = false;
-                _widgetState.Save();
-                if (_widgetItem != null)
-                {
-                    _widgetItem.Checked = false;
-                }
-            };
+            _widget = CreateWidget();
 
             _openItem = new ToolStripMenuItem("開啟用量")
             {
@@ -231,6 +233,20 @@ namespace CodexClaudeUsage
             _timer = new System.Windows.Forms.Timer { Interval = config.RefreshSeconds * 1000 };
             _timer.Tick += delegate { RefreshUsage(); };
             _timer.Start();
+            _tokenTimer = new System.Windows.Forms.Timer { Interval = 5000 };
+            _tokenTimer.Tick += delegate { RefreshTokens(); };
+            _tokenTimer.Start();
+            _claudeMonitor = new ClaudeUsageMonitor(ClaudeUsageSource.FindDesktopHistory, AppPaths.ClaudeStatusCache);
+            _claudeMonitor.UpdatePaths();
+            _claudeLiveTimer = new System.Windows.Forms.Timer { Interval = 250 };
+            _claudeLiveTimer.Tick += delegate
+            {
+                if (!_shuttingDown && _claudeMonitor.TryTakeChange(DateTimeOffset.UtcNow, _isRefreshing))
+                    RefreshUsage();
+            };
+            _claudeLiveTimer.Start();
+            _widgetRecoveryTimer = new System.Windows.Forms.Timer { Interval = 250 };
+            _widgetRecoveryTimer.Tick += delegate { RecoverWidget(); };
 
             _showRegistration = ThreadPool.RegisterWaitForSingleObject(
                 showEvent,
@@ -264,6 +280,64 @@ namespace CodexClaudeUsage
             if (e.Button == MouseButtons.Left)
             {
                 TogglePopup(false);
+            }
+        }
+
+        private DesktopWidget CreateWidget()
+        {
+            var widget = new DesktopWidget(_widgetState);
+            widget.OpenAtRequested += delegate(Point landing) { _popup.ShowLiquidReveal(landing); };
+            widget.RefreshRequested += delegate { RefreshUsage(); };
+            widget.HiddenByUser += delegate
+            {
+                _widgetState.Enabled = false;
+                _widgetState.Save();
+                if (_widgetItem != null) _widgetItem.Checked = false;
+            };
+            widget.RecoveryRequested += delegate
+            {
+                if (_shuttingDown || _widgetRecoveryTimer == null || _widgetRecoveryTimer.Enabled) return;
+                var wait = _lastWidgetRecovery.AddSeconds(30) - DateTimeOffset.UtcNow;
+                _widgetRecoveryTimer.Interval = Math.Max(250, (int)Math.Max(0, wait.TotalMilliseconds));
+                _widgetRecoveryTimer.Start();
+            };
+            return widget;
+        }
+
+        private void RecoverWidget()
+        {
+            _widgetRecoveryTimer.Stop();
+            if (_shuttingDown) return;
+            _lastWidgetRecovery = DateTimeOffset.UtcNow;
+            DesktopWidget replacement = null;
+            try
+            {
+                var previous = _widget;
+                var location = previous.Location;
+                replacement = CreateWidget();
+                replacement.SetSnapshot(_latestSnapshot);
+                if (_widgetState.Enabled)
+                {
+                    _widgetState.X = location.X;
+                    _widgetState.Y = location.Y;
+                    replacement.ShowWidget();
+                }
+                _widget = replacement;
+                replacement = null;
+                previous.Dispose();
+                _center.SetStatus("桌面小工具已自動恢復");
+            }
+            catch (OutOfMemoryException) { throw; }
+            catch (Exception ex)
+            {
+                Program.LogError(ex);
+                _center.SetStatus("小工具恢復失敗，30 秒後重試");
+                _widgetRecoveryTimer.Interval = 30000;
+                _widgetRecoveryTimer.Start();
+            }
+            finally
+            {
+                if (replacement != null) replacement.Dispose();
             }
         }
 
@@ -402,12 +476,14 @@ namespace CodexClaudeUsage
 
         private async void RefreshUsage()
         {
-            if (_isRefreshing)
+            if (_isRefreshing || _shuttingDown)
             {
                 return;
             }
 
             _isRefreshing = true;
+            _timer.Stop();
+            RefreshTokens();
             _refreshItem.Enabled = false;
             _popup.SetLoading(true);
             if (_center.Visible)
@@ -422,6 +498,7 @@ namespace CodexClaudeUsage
                 {
                     return await _aggregator.ReadAsync().ConfigureAwait(false);
                 });
+                if (_shuttingDown) return;
                 if (visibleFeedback)
                 {
                     var remaining = MinimumVisibleRefreshMilliseconds - (int)feedbackClock.ElapsedMilliseconds;
@@ -430,6 +507,7 @@ namespace CodexClaudeUsage
                         await Task.Delay(remaining);
                     }
                 }
+                if (_shuttingDown) return;
                 _latestSnapshot = snapshot;
                 _cycleHistory.Observe(snapshot);
                 _popup.SetSnapshot(UsageSelection.ForDisplay(snapshot, _preferences.TotalOnly));
@@ -437,10 +515,24 @@ namespace CodexClaudeUsage
                 UpdateTrayText(snapshot);
                 ProcessNotifications(snapshot);
                 UpdateUsageCenter(snapshot);
+                if (snapshot.Codex.IsAvailable || snapshot.Claude.IsAvailable || snapshot.Antigravity.IsAvailable)
+                {
+                    _recovery.ReportSuccess(DateTimeOffset.Now);
+                    var partial = !snapshot.Codex.IsAvailable || !snapshot.Claude.IsAvailable || !snapshot.Antigravity.IsAvailable;
+                    _center.SetStatus("最近成功讀取 " + _recovery.LastSuccessAt.Value.ToString("MM/dd HH:mm:ss")
+                        + (partial ? " · 部分來源無法讀取，持續重試" : string.Empty));
+                }
+                else
+                {
+                    _recovery.ReportFailure(DateTimeOffset.Now);
+                    ShowRetryStatus();
+                }
             }
             catch (Exception ex)
             {
                 Program.LogError(ex);
+                if (_shuttingDown) return;
+                _recovery.ReportFailure(DateTimeOffset.Now);
                 _trayIcon.Text = "用量更新失敗";
                 if (_popup.Visible)
                 {
@@ -448,14 +540,76 @@ namespace CodexClaudeUsage
                 }
                 if (_center.Visible)
                 {
-                    _center.SetStatus("更新失敗：" + Compact(ex.Message));
+                    ShowRetryStatus();
                 }
             }
             finally
             {
-                _popup.SetLoading(false);
-                _refreshItem.Enabled = true;
                 _isRefreshing = false;
+                if (!_shuttingDown)
+                {
+                    _claudeMonitor.UpdatePaths();
+                    _popup.SetLoading(false);
+                    _refreshItem.Enabled = true;
+                    _timer.Interval = _recovery.ConsecutiveFailures > 0
+                        ? (int)_recovery.NextDelay.TotalMilliseconds : _config.RefreshSeconds * 1000;
+                    _timer.Start();
+                }
+            }
+        }
+
+        private void ShowRetryStatus()
+        {
+            var last = _recovery.LastSuccessAt.HasValue
+                ? _recovery.LastSuccessAt.Value.ToString("MM/dd HH:mm:ss") : "尚無成功紀錄";
+            _center.SetStatus(string.Format(CultureInfo.CurrentCulture,
+                "更新失敗，{0:0} 秒後重試 · 最近成功 {1}", _recovery.NextDelay.TotalSeconds, last));
+        }
+
+        private async void RefreshTokens()
+        {
+            if (_isRefreshingTokens || _shuttingDown) return;
+            _isRefreshingTokens = true;
+            _tokenTimer.Stop();
+            try
+            {
+                var snapshot = await Task.Run(delegate
+                {
+                    if (_tokenReader == null) _tokenReader = new TokenAnalyticsReader();
+                    return _tokenReader.Read(_tokenCancellation.Token);
+                });
+                if (_shuttingDown) return;
+                _latestTokens = snapshot;
+                _center.SetTokenAnalytics(snapshot);
+                _tokenTimer.Interval = snapshot.IsIndexing ? 250 : 60000;
+                var alert = _tokenBudget.Evaluate(snapshot, _preferences, DateTimeOffset.Now, _notificationItem.Checked);
+                if (alert != null)
+                {
+                    _trayIcon.ShowBalloonTip(6000, alert.Level >= 100 ? "今日 Token 預算已達上限" : "今日 Token 接近預算",
+                        string.Format(CultureInfo.CurrentCulture, "本機今日已用 {0:N0} / {1:N0} Token", alert.Used, alert.Budget),
+                        ToolTipIcon.Warning);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!_shuttingDown)
+                {
+                    Program.LogError(ex);
+                    _center.SetTokenAnalytics(new TokenAnalyticsSnapshot
+                    {
+                        Rows = _latestTokens == null ? new List<TokenUsageEntry>() : _latestTokens.Rows,
+                        CapturedAt = _latestTokens == null ? DateTimeOffset.MinValue : _latestTokens.CapturedAt,
+                        LastRecordAt = _latestTokens == null ? null : _latestTokens.LastRecordAt,
+                        CoverageStart = _latestTokens == null ? DateTime.Today.AddDays(-89) : _latestTokens.CoverageStart,
+                        Status = "Token 索引暫時無法更新，稍後重試；顯示上次結果"
+                    });
+                    _tokenTimer.Interval = 15000;
+                }
+            }
+            finally
+            {
+                _isRefreshingTokens = false;
+                if (!_shuttingDown) _tokenTimer.Start();
             }
         }
 
@@ -911,6 +1065,30 @@ namespace CodexClaudeUsage
             }
         }
 
+        private void ExportTokens(List<TokenUsageEntry> rows)
+        {
+            using (var dialog = new SaveFileDialog
+            {
+                AddExtension = true,
+                DefaultExt = "csv",
+                Filter = "CSV 檔案 (*.csv)|*.csv",
+                FileName = "token-usage-" + DateTime.Now.ToString("yyyyMMdd-HHmm", CultureInfo.InvariantCulture)
+            })
+            {
+                if (dialog.ShowDialog(_center) != DialogResult.OK) return;
+                try
+                {
+                    System.IO.File.WriteAllText(dialog.FileName, TokenAnalyticsReport.ToCsv(rows), new System.Text.UTF8Encoding(true));
+                    _center.SetStatus("已匯出目前篩選的 Token 報表");
+                }
+                catch (Exception ex)
+                {
+                    Program.LogError(ex);
+                    _center.SetStatus("匯出失敗：" + Compact(ex.Message));
+                }
+            }
+        }
+
         private void RepairClaudeBridge()
         {
             var result = ClaudeBridgeHealth.Repair();
@@ -955,7 +1133,13 @@ namespace CodexClaudeUsage
 
         private void ExitApplication()
         {
+            _shuttingDown = true;
+            _tokenCancellation.Cancel();
             _timer.Stop();
+            _tokenTimer.Stop();
+            _claudeLiveTimer.Stop();
+            _claudeMonitor.Dispose();
+            _widgetRecoveryTimer.Stop();
             _hotkeys.Disable();
             _trayIcon.Visible = false;
             _widget.Close();
@@ -968,7 +1152,13 @@ namespace CodexClaudeUsage
         {
             if (disposing)
             {
+                _shuttingDown = true;
+                _tokenCancellation.Cancel();
                 _timer.Dispose();
+                _tokenTimer.Dispose();
+                _claudeLiveTimer.Dispose();
+                _claudeMonitor.Dispose();
+                _widgetRecoveryTimer.Dispose();
                 _menuCommandTimer.Dispose();
                 if (_showRegistration != null)
                 {

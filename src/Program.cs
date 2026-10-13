@@ -164,6 +164,10 @@ namespace CodexClaudeUsage
                     history.GetCycles(preferences.HistoryRetentionDays),
                     UsageDiagnostics.Evaluate(snapshot),
                     ClaudeBridgeHealth.Check());
+                if (selectedTab == 4)
+                {
+                    center.SetTokenAnalytics(new TokenAnalyticsReader().Read());
+                }
                 center.CreateControl();
                 CreateChildControls(center);
                 center.Show();
@@ -253,6 +257,14 @@ namespace CodexClaudeUsage
                 { "status", provider.Status },
                 { "error", provider.Error },
                 { "updatedAt", provider.UpdatedAt.ToString("o", CultureInfo.InvariantCulture) },
+                { "localSessionTokens", provider.Tokens == null ? null : new Dictionary<string, object>
+                    {
+                        { "input", provider.Tokens.InputTokens },
+                        { "output", provider.Tokens.OutputTokens },
+                        { "total", provider.Tokens.TotalTokens },
+                        { "updatedAt", provider.Tokens.UpdatedAt.ToString("o", CultureInfo.InvariantCulture) }
+                    }
+                },
                 { "buckets", buckets }
             };
         }

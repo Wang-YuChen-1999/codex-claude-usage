@@ -13,6 +13,8 @@ $env:CODEX_CLAUDE_USAGE_PREFERENCES_PATH = $preferencesPath
 $env:CODEX_CLAUDE_USAGE_KEEP_OPEN = '1'
 $context = $null
 $showEvent = $null
+$dataRoot = Join-Path $env:TEMP "CodexClaudeUsage-tray-data-$PID"
+$pathFields = @{}
 
 function Pump-Events([int] $milliseconds) {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($milliseconds)
@@ -41,6 +43,14 @@ try {
     [Windows.Forms.Application]::EnableVisualStyles()
     [Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
     $assembly = [Reflection.Assembly]::LoadFile((Join-Path $root 'dist\CodexClaudeUsage.exe'))
+    New-Item -ItemType Directory -Path $dataRoot -Force | Out-Null
+    $pathsType = $assembly.GetType('CodexClaudeUsage.AppPaths', $true)
+    foreach ($name in @('LocalData', 'NotificationState')) {
+        $field = $pathsType.GetField($name, [Reflection.BindingFlags]'Static,Public')
+        $pathFields[$name] = @($field, $field.GetValue($null))
+        $value = if ($name -eq 'LocalData') { $dataRoot } else { Join-Path $dataRoot 'notification-state.json' }
+        $field.SetValue($null, [string]$value)
+    }
     $preferencesType = $assembly.GetType('CodexClaudeUsage.UserPreferences', $true)
     $preferences = $preferencesType.GetMethod('Load').Invoke($null, @())
     $preferencesType.GetProperty('TotalOnly').SetValue($preferences, $true, $null)
@@ -61,6 +71,15 @@ try {
     $detailItem = $contextType.GetField('_detailItem', $flags).GetValue($context)
     $centerItem = $contextType.GetField('_centerItem', $flags).GetValue($context)
     $menu = $contextType.GetField('_menu', $flags).GetValue($context)
+
+    $refreshField = $contextType.GetField('_isRefreshing', $flags)
+    $refreshDeadline = [DateTime]::UtcNow.AddSeconds(15)
+    while ([bool]$refreshField.GetValue($context)) {
+        if ([DateTime]::UtcNow -ge $refreshDeadline) {
+            throw 'Initial background refresh did not finish before the tray command test.'
+        }
+        Pump-Events 50
+    }
 
     $snapshotType = $assembly.GetType('CodexClaudeUsage.UsageSnapshot', $true)
     $snapshot = [Activator]::CreateInstance($snapshotType)
@@ -120,10 +139,21 @@ try {
     Write-Host 'PASS: tray commands open short-window usage and the usage center with persisted state'
 }
 finally {
-    if ($null -ne $context) { $context.Dispose() }
+    if ($null -ne $context) {
+        $context.Dispose()
+        $tokensBusy = $context.GetType().GetField('_isRefreshingTokens', [Reflection.BindingFlags]'Instance,NonPublic')
+        $stopDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        while ($tokensBusy.GetValue($context) -and [DateTime]::UtcNow -lt $stopDeadline) { Pump-Events 20 }
+    }
     if ($null -ne $showEvent) { $showEvent.Dispose() }
+    foreach ($entry in $pathFields.Values) { $entry[0].SetValue($null, $entry[1]) }
     Remove-Item Env:\CODEX_CLAUDE_USAGE_PREFERENCES_PATH -ErrorAction SilentlyContinue
     Remove-Item Env:\CODEX_CLAUDE_USAGE_KEEP_OPEN -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $preferencesPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath "$preferencesPath.tmp" -Force -ErrorAction SilentlyContinue
+    $resolvedData = [IO.Path]::GetFullPath($dataRoot)
+    $temporaryBase = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + '\'
+    if ($resolvedData.StartsWith($temporaryBase, [StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item -LiteralPath $resolvedData -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }

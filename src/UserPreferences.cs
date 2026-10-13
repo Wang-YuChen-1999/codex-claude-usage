@@ -18,6 +18,7 @@ namespace CodexClaudeUsage
         private int _historyRetentionDays;
         private int _quietStartMinutes;
         private int _quietEndMinutes;
+        private long _tokenDailyBudget;
 
         public UserPreferences()
         {
@@ -33,6 +34,7 @@ namespace CodexClaudeUsage
             QuietEndMinutes = 480;
             HistoryRetentionDays = DefaultHistoryRetentionDays;
             GlobalHotkeysEnabled = true;
+            NotifyTokenBudget = true;
         }
 
         public bool TotalOnly { get; set; }
@@ -63,6 +65,12 @@ namespace CodexClaudeUsage
         }
 
         public bool GlobalHotkeysEnabled { get; set; }
+        public bool NotifyTokenBudget { get; set; }
+        public long TokenDailyBudget
+        {
+            get { return _tokenDailyBudget; }
+            set { _tokenDailyBudget = Math.Max(0L, Math.Min(9000000000000000L, value)); }
+        }
 
         public static UserPreferences Load()
         {
@@ -93,6 +101,8 @@ namespace CodexClaudeUsage
                 preferences.QuietEndMinutes = Json.Int(map, "quietEndMinutes", preferences.QuietEndMinutes);
                 preferences.HistoryRetentionDays = Json.Int(map, "historyRetentionDays", preferences.HistoryRetentionDays);
                 preferences.GlobalHotkeysEnabled = Json.Bool(map, "globalHotkeysEnabled", preferences.GlobalHotkeysEnabled);
+                preferences.NotifyTokenBudget = Json.Bool(map, "notifyTokenBudget", preferences.NotifyTokenBudget);
+                preferences.TokenDailyBudget = Json.Long(map, "tokenDailyBudget", 0);
             }
             catch
             {
@@ -125,7 +135,9 @@ namespace CodexClaudeUsage
                 { "quietStartMinutes", QuietStartMinutes },
                 { "quietEndMinutes", QuietEndMinutes },
                 { "historyRetentionDays", HistoryRetentionDays },
-                { "globalHotkeysEnabled", GlobalHotkeysEnabled }
+                { "globalHotkeysEnabled", GlobalHotkeysEnabled },
+                { "notifyTokenBudget", NotifyTokenBudget },
+                { "tokenDailyBudget", TokenDailyBudget }
             };
 
             var temporary = path + ".tmp";

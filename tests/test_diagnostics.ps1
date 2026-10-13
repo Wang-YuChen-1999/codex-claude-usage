@@ -87,6 +87,29 @@ try {
     [IO.File]::WriteAllText($settings, $managed)
     $null = Invoke-Static 'ClaudeBridgeHealth' 'Repair'
     if (-not ((Get-Content -LiteralPath $settings -Raw | ConvertFrom-Json).statusLine.command.Contains($bridge))) { throw 'Managed statusLine was not updated.' }
+    # Empty, reset-only and invalid usage reports must not mark the bridge ready.
+    foreach ($limits in @(
+        @{},
+        @{ five_hour = @{ resets_at = [DateTimeOffset]::UtcNow.AddHours(2).ToUnixTimeSeconds() } },
+        @{ five_hour = @{ used_percentage = $true } },
+        @{ five_hour = @{ used_percentage = -1 } },
+        @{ five_hour = @{ used_percentage = 101 } },
+        @{ five_hour = @{ used_percentage = 'NaN' } },
+        @{ five_hour = @{ used_percentage = 'Infinity' } }
+    )) {
+        $record = @{ capturedAt = [DateTimeOffset]::UtcNow.ToString('o'); rate_limits = $limits } | ConvertTo-Json -Depth 6
+        [IO.File]::WriteAllText($bridgeData, $record)
+        if ((Invoke-Static 'ClaudeBridgeHealth' 'Check').State.ToString() -ne 'WaitingForData') {
+            throw 'Bridge health reported ready without any valid usage.'
+        }
+    }
+    foreach ($used in @(0, 100)) {
+        $record = @{ capturedAt = [DateTimeOffset]::UtcNow.ToString('o'); rate_limits = @{ five_hour = @{ used_percentage = $used } } } | ConvertTo-Json -Depth 6
+        [IO.File]::WriteAllText($bridgeData, $record)
+        if ((Invoke-Static 'ClaudeBridgeHealth' 'Check').State.ToString() -ne 'Ready') {
+            throw 'Bridge health rejected a valid boundary percentage.'
+        }
+    }
     $custom = @{ statusLine = @{ type = 'command'; command = 'my-custom-status.ps1' } } | ConvertTo-Json -Depth 5
     [IO.File]::WriteAllText($settings, $custom)
     $customResult = Invoke-Static 'ClaudeBridgeHealth' 'Repair'

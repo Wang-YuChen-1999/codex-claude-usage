@@ -52,13 +52,14 @@ try {
         if (@('None', 'UpperBound', 'Cycle') -notcontains [string]$bucket.resetEstimate) {
             throw "Antigravity bucket resetEstimate invalid: $($bucket.resetEstimate)"
         }
-        # 尚未使用的額度，官方回報的是「現在起算」的視窗結束點，每次採樣都會往後滑動，
-        # 必須標記為推估上限，面板才不會顯示一個永遠不會到來的重設時刻。
-        if ([double]$bucket.usedPercent -le 0.05 -and [string]$bucket.resetEstimate -ne 'UpperBound') {
-            throw "Idle Antigravity bucket must be flagged as an upper-bound estimate: $($bucket.label)"
-        }
-        if ([double]$bucket.usedPercent -gt 0.05 -and [string]$bucket.resetEstimate -ne 'None') {
-            throw "Active Antigravity bucket must use the official reset time: $($bucket.label)"
+        # 只有未使用且重設點接近「採樣時間 + 視窗長度」時，才是會滑動的推估上限。
+        # 官方也可能對 0% 的每週額度回傳固定重設點。
+        $resetTime = [DateTimeOffset]$bucket.resetsAt
+        $capturedAt = [DateTimeOffset]$snapshot.antigravity.updatedAt
+        $sliding = [Math]::Abs(($resetTime - $capturedAt).TotalMinutes - [int]$bucket.windowDurationMinutes) -le 5
+        $expectedEstimate = if ([double]$bucket.usedPercent -le 0.05 -and $sliding) { 'UpperBound' } else { 'None' }
+        if ([string]$bucket.resetEstimate -ne $expectedEstimate) {
+            throw "Antigravity reset classification mismatch for $($bucket.label): expected $expectedEstimate, got $($bucket.resetEstimate)"
         }
         if ($null -eq $bucket.trendPointCount) {
             throw "Antigravity bucket trendPointCount missing: $($bucket.label)"

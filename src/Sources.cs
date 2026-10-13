@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Management;
 using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -276,7 +277,13 @@ namespace CodexClaudeUsage
             var codexTask = _codex.ReadAsync();
             var claudeTask = _claude.ReadAsync();
             var antigravityTask = _antigravity.ReadAsync();
-            await Task.WhenAll(codexTask, claudeTask, antigravityTask).ConfigureAwait(false);
+            var codexTokensTask = Task.Run(() => LocalTokenUsageReader.ReadCodexLatestSession(
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "sessions")));
+            var claudeTokensTask = Task.Run(() => LocalTokenUsageReader.ReadClaudeLatestSession(
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects")));
+            await Task.WhenAll(codexTask, claudeTask, antigravityTask, codexTokensTask, claudeTokensTask).ConfigureAwait(false);
+            codexTask.Result.Tokens = codexTokensTask.Result;
+            claudeTask.Result.Tokens = claudeTokensTask.Result;
             return new UsageSnapshot
             {
                 Codex = codexTask.Result,
@@ -876,18 +883,40 @@ namespace CodexClaudeUsage
                 return;
             }
 
-            AddBridgeBucket(snapshot, "目前工作階段", Json.Map(limits, "five_hour"), overwriteUsage);
-            AddBridgeBucket(snapshot, "所有模型 · 每週", Json.Map(limits, "seven_day"), overwriteUsage);
-            AddBridgeBucket(snapshot, "Opus · 每週", Json.Map(limits, "seven_day_opus"), overwriteUsage);
-            AddBridgeBucket(snapshot, "Sonnet · 每週", Json.Map(limits, "seven_day_sonnet"), overwriteUsage);
+            var updatedCount = 0;
+            if (AddBridgeBucket(snapshot, "目前工作階段", Json.Map(limits, "five_hour"), overwriteUsage)) updatedCount++;
+            if (AddBridgeBucket(snapshot, "所有模型 · 每週", Json.Map(limits, "seven_day"), overwriteUsage)) updatedCount++;
+            if (AddBridgeBucket(snapshot, "Opus · 每週", Json.Map(limits, "seven_day_opus"), overwriteUsage)) updatedCount++;
+            if (AddBridgeBucket(snapshot, "Sonnet · 每週", Json.Map(limits, "seven_day_sonnet"), overwriteUsage)) updatedCount++;
 
-            if (capturedAt > snapshot.UpdatedAt)
+            // 供應商只有一個時間戳；混合新舊額度時採較舊時間，不能替未更新額度宣告新鮮。
+            if (updatedCount > 0 && (updatedCount == snapshot.Buckets.Count || capturedAt < snapshot.UpdatedAt))
             {
                 snapshot.UpdatedAt = capturedAt;
             }
         }
 
-        private static void AddBridgeBucket(
+        internal static bool HasValidBridgeUsage(IDictionary<string, object> limits)
+        {
+            if (limits == null) return false;
+            foreach (var key in new[] { "five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet" })
+            {
+                double used;
+                if (TryBridgeUsage(Json.Map(limits, key), out used)) return true;
+            }
+            return false;
+        }
+
+        private static bool TryBridgeUsage(IDictionary<string, object> limit, out double used)
+        {
+            used = 0;
+            var value = Json.Get(limit, "used_percentage") ?? Json.Get(limit, "usedPercent");
+            if (value is bool) return false;
+            return (Json.TryDouble(limit, "used_percentage", out used) || Json.TryDouble(limit, "usedPercent", out used))
+                && used >= 0 && used <= 100;
+        }
+
+        private static bool AddBridgeBucket(
             ProviderSnapshot snapshot,
             string label,
             IDictionary<string, object> limit,
@@ -895,12 +924,11 @@ namespace CodexClaudeUsage
         {
             if (limit == null)
             {
-                return;
+                return false;
             }
 
             double used;
-            var hasUsed = Json.TryDouble(limit, "used_percentage", out used)
-                || Json.TryDouble(limit, "usedPercent", out used);
+            var hasUsed = TryBridgeUsage(limit, out used);
             var reset = Json.Get(limit, "resets_at") ?? Json.Get(limit, "resetsAt");
             var resetAt = TimeUtil.ParseReset(reset);
             if (resetAt.HasValue && resetAt.Value <= DateTimeOffset.Now)
@@ -913,7 +941,7 @@ namespace CodexClaudeUsage
             {
                 if (!hasUsed)
                 {
-                    return;
+                    return false;
                 }
                 snapshot.Buckets.Add(new UsageBucket
                 {
@@ -922,7 +950,7 @@ namespace CodexClaudeUsage
                     UsedPercent = CodexUsageSource.Clamp(used),
                     ResetsAt = resetAt
                 });
-                return;
+                return true;
             }
 
             if (overwriteUsage && hasUsed)
@@ -935,6 +963,7 @@ namespace CodexClaudeUsage
                 existing.ResetsAt = resetAt;
                 existing.ResetEstimate = ResetEstimateKind.None;
             }
+            return overwriteUsage && hasUsed;
         }
 
         private static void ApplyDesktopHistory(ProviderSnapshot snapshot)
@@ -1190,7 +1219,7 @@ namespace CodexClaudeUsage
             }
         }
 
-        private static string FindDesktopHistory()
+        internal static string FindDesktopHistory()
         {
             var overridePath = Environment.GetEnvironmentVariable("CODEX_CLAUDE_USAGE_CLAUDE_HISTORY_PATH");
             if (!string.IsNullOrWhiteSpace(overridePath))
@@ -1511,7 +1540,7 @@ namespace CodexClaudeUsage
                 }
                 catch (Exception ex)
                 {
-                    error = ex.Message;
+                    error = ConnectionError(ex);
                 }
                 InvalidateCredentials();
             }
@@ -1530,7 +1559,25 @@ namespace CodexClaudeUsage
                 }
                 catch (Exception ex)
                 {
-                    error = ex.Message;
+                    error = ConnectionError(ex);
+                }
+            }
+
+            // 記錄檔可能仍保留先前執行個體的 CSRF；以監聽埠的擁有程序重新配對。
+            foreach (var connection in DiscoverActiveServerConnections())
+            {
+                try
+                {
+                    if (QueryServer(snapshot, connection.Key, connection.Value))
+                    {
+                        CacheCredentials(connection.Key, connection.Value);
+                        SaveCache(snapshot);
+                        return snapshot;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    error = ConnectionError(ex);
                 }
             }
 
@@ -1546,6 +1593,88 @@ namespace CodexClaudeUsage
                 ? "請先啟動 Antigravity"
                 : error;
             return snapshot;
+        }
+
+        private static List<KeyValuePair<int, string>> DiscoverActiveServerConnections()
+        {
+            var result = new List<KeyValuePair<int, string>>();
+            try
+            {
+                using (var searcher = new ManagementObjectSearcher(
+                    "SELECT ProcessId, ExecutablePath, CommandLine FROM Win32_Process WHERE Name = 'language_server.exe'"))
+                using (var processes = searcher.Get())
+                {
+                    foreach (ManagementObject process in processes)
+                    {
+                        try
+                        {
+                            var executable = Convert.ToString(process["ExecutablePath"], CultureInfo.InvariantCulture);
+                            if (string.IsNullOrEmpty(executable)
+                                || executable.IndexOf("Antigravity", StringComparison.OrdinalIgnoreCase) < 0)
+                            {
+                                continue;
+                            }
+
+                            var commandLine = Convert.ToString(process["CommandLine"], CultureInfo.InvariantCulture);
+                            var tokenMatch = Regex.Match(commandLine ?? string.Empty,
+                                @"--csrf_token\s+([a-f0-9\-]+)", RegexOptions.IgnoreCase);
+                            if (!tokenMatch.Success) continue;
+
+                            var processId = Convert.ToInt32(process["ProcessId"], CultureInfo.InvariantCulture);
+                            var query = string.Format(CultureInfo.InvariantCulture,
+                                "SELECT LocalPort, LocalAddress FROM MSFT_NetTCPConnection WHERE OwningProcess = {0} AND State = 2",
+                                processId);
+                            using (var listeners = new ManagementObjectSearcher(@"root\StandardCimv2", query))
+                            using (var ports = listeners.Get())
+                            {
+                                foreach (ManagementObject listener in ports)
+                                {
+                                    try
+                                    {
+                                        var address = Convert.ToString(listener["LocalAddress"], CultureInfo.InvariantCulture);
+                                        if (address != "127.0.0.1" && address != "0.0.0.0") continue;
+
+                                        var port = Convert.ToInt32(listener["LocalPort"], CultureInfo.InvariantCulture);
+                                        if (port <= 0 || port > 65535) continue;
+                                        if (!result.Any(item => item.Key == port))
+                                        {
+                                            result.Add(new KeyValuePair<int, string>(port, tokenMatch.Groups[1].Value));
+                                        }
+                                    }
+                                    finally
+                                    {
+                                        listener.Dispose();
+                                    }
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            // 無法查詢此程序時，仍可嘗試其他執行個體或記錄檔。
+                        }
+                        finally
+                        {
+                            process.Dispose();
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // WMI 不可用時保留既有記錄檔與本機快取後備路徑。
+            }
+            return result;
+        }
+
+        private static string ConnectionError(Exception exception)
+        {
+            var web = exception as WebException;
+            var response = web == null ? null : web.Response as HttpWebResponse;
+            if (response != null && response.StatusCode == HttpStatusCode.Unauthorized)
+            {
+                return "Antigravity 驗證失敗，請在 Antigravity 檢查登入狀態";
+            }
+            return exception.Message;
         }
 
         private static bool TryGetCachedCredentials(out int port, out string csrf)

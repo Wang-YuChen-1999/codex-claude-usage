@@ -66,7 +66,15 @@ function Assert-KeyLayout(
     Assert-Contained $selectedPage "$sizeName selected content page"
     foreach ($control in $selectedPage.Controls) {
         if ($control.Visible) {
-            Assert-Contained $control "$sizeName selected-page child '$($control.Name)'"
+            if ($selectedPage.AutoScroll -and $control.Bottom -gt $selectedPage.ClientSize.Height) {
+                if ($control.Left -lt -1 -or $control.Right -gt ($selectedPage.ClientSize.Width + 1) -or
+                    -not $selectedPage.VerticalScroll.Visible) {
+                    throw "$sizeName scrollable child '$($control.Name)' is not reachable within the page."
+                }
+            }
+            else {
+                Assert-Contained $control "$sizeName selected-page child '$($control.Name)'"
+            }
         }
     }
 }
@@ -90,16 +98,51 @@ try {
     $constructor = $formType.GetConstructors([Reflection.BindingFlags]'Instance,Public,NonPublic') | Select-Object -First 1
     $form = $constructor.Invoke([object[]]@($config, $preferences))
 
+    # Preserve rolling-window metadata all the way to the rendered timeline.
+    $providerType = $assembly.GetType('CodexClaudeUsage.ProviderSnapshot', $true)
+    $bucketType = $assembly.GetType('CodexClaudeUsage.UsageBucket', $true)
+    $snapshotType = $assembly.GetType('CodexClaudeUsage.UsageSnapshot', $true)
+    $insightsType = $assembly.GetType('CodexClaudeUsage.UsageInsights', $true)
+    $estimateType = $assembly.GetType('CodexClaudeUsage.ResetEstimateKind', $true)
+    $provider = [Activator]::CreateInstance($providerType, @('Antigravity'))
+    $provider.IsAvailable = $true
+    $provider.UpdatedAt = [DateTimeOffset]::UtcNow
+    $bucket = [Activator]::CreateInstance($bucketType)
+    $bucket.Label = [Regex]::Unescape('Gemini \u6bcf\u9031')
+    $bucket.ResetsAt = [DateTimeOffset]::UtcNow.AddDays(7)
+    $bucket.WindowDurationMinutes = 10080
+    $bucket.ResetEstimate = [Enum]::Parse($estimateType, 'UpperBound')
+    $provider.Buckets.Add($bucket)
+    $snapshot = [Activator]::CreateInstance($snapshotType)
+    $snapshot.Antigravity = $provider
+    $report = $insightsType.GetMethod('Build', [Reflection.BindingFlags]'Static,Public,NonPublic', $null,
+        [Type[]]@($snapshotType, [DateTimeOffset]), $null).Invoke($null, @($snapshot, [DateTimeOffset]::UtcNow))
+    $formType.GetMethod('PopulateTimeline', $flags).Invoke($form, @($snapshot, $report)) | Out-Null
+    $timeline = $formType.GetField('_timeline', $flags).GetValue($form)
+    $notStarted = [Regex]::Unescape('\u5c1a\u672a\u958b\u59cb\u8a08\u6642')
+    if ($timeline.Items.Count -ne 1 -or $timeline.Items[0].SubItems[1].Text -ne $notStarted) {
+        throw 'The usage-center timeline must show an idle rolling window without a fixed countdown.'
+    }
+    $rowType = $formType.GetNestedType('ProviderUsageRow', [Reflection.BindingFlags]'NonPublic')
+    $paceText = $rowType.GetMethod('PaceText', [Reflection.BindingFlags]'Static,NonPublic')
+    if ($paceText.Invoke($null, @($bucket)) -ne $notStarted) {
+        throw 'The overview fallback must not display a daily pace for an idle rolling window.'
+    }
+    $bucket.ResetEstimate = [Enum]::Parse($estimateType, 'None')
+    if ($paceText.Invoke($null, @($bucket)) -eq $notStarted) {
+        throw 'A real fixed deadline with zero usage must not be presented as an idle rolling window.'
+    }
+
     $tabs = $formType.GetField('_tabs', $flags).GetValue($form)
     if ($null -eq $tabs) {
         throw 'Usage center _tabs field is null.'
     }
     $tabCountProperty = $tabs.GetType().GetProperty('TabCount', [Reflection.BindingFlags]'Instance,Public,NonPublic')
-    if ($null -eq $tabCountProperty -or [int]$tabCountProperty.GetValue($tabs, $null) -ne 4) {
-        throw 'Usage center navigation must expose TabCount=4.'
+    if ($null -eq $tabCountProperty -or [int]$tabCountProperty.GetValue($tabs, $null) -ne 5) {
+        throw 'Usage center navigation must expose TabCount=5.'
     }
 
-    $pageFields = @('_overviewPage', '_historyPage', '_healthPage', '_settingsPage')
+    $pageFields = @('_overviewPage', '_historyPage', '_healthPage', '_settingsPage', '_tokenAnalyticsPage')
     $pages = @($pageFields | ForEach-Object { $formType.GetField($_, $flags).GetValue($form) })
     if (($pages | Where-Object { $null -eq $_ }).Count -gt 0) {
         throw 'One or more usage-center content pages are missing.'
@@ -114,8 +157,8 @@ try {
     }
 
     $lists = @($allControls | Where-Object { $_ -is [Windows.Forms.ListView] })
-    if ($lists.Count -ne 3) {
-        throw "Expected exactly three ListView controls; found $($lists.Count)."
+    if ($lists.Count -ne 5) {
+        throw "Expected exactly five ListView controls; found $($lists.Count)."
     }
     foreach ($list in $lists) {
         if (-not $list.OwnerDraw) {
@@ -193,7 +236,7 @@ try {
     )) {
         $form.Size = $sizeCase.Size
         Pump-Events 120
-        for ($index = 0; $index -lt 4; $index++) {
+        for ($index = 0; $index -lt 5; $index++) {
             $selectTab.Invoke($form, @([int]$index)) | Out-Null
             Pump-Events 100
             $visiblePages = @($pages | Where-Object { $_.Visible })
@@ -204,7 +247,7 @@ try {
         }
     }
 
-    Write-Host 'PASS: usage center uses borderless overview bands, four custom tabs, dark owner-drawn lists, exclusive pages, and bounded layouts'
+    Write-Host 'PASS: usage center uses borderless overview bands, five custom tabs, dark owner-drawn lists, exclusive pages, and bounded layouts'
 }
 finally {
     if ($null -ne $form) {

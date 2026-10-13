@@ -400,7 +400,8 @@ if ($parts.Count -gt 0) { [Console]::Write(($parts -join ' | ')) }
             {
                 if (!File.Exists(AppPaths.ClaudeStatusCache)) return false;
                 var record = Json.Object(Json.DeserializeObject(File.ReadAllText(AppPaths.ClaudeStatusCache)));
-                if (record == null || (Json.Map(record, "rate_limits") ?? Json.Map(record, "rateLimits")) == null)
+                if (record == null || !ClaudeUsageSource.HasValidBridgeUsage(
+                    Json.Map(record, "rate_limits") ?? Json.Map(record, "rateLimits")))
                 {
                     return false;
                 }

@@ -11,6 +11,7 @@ $providerType = $assembly.GetType('CodexClaudeUsage.ProviderSnapshot', $true)
 $bucketType = $assembly.GetType('CodexClaudeUsage.UsageBucket', $true)
 $snapshotType = $assembly.GetType('CodexClaudeUsage.UsageSnapshot', $true)
 $selectionType = $assembly.GetType('CodexClaudeUsage.UsageSelection', $true)
+$tokenType = $assembly.GetType('CodexClaudeUsage.LocalTokenUsage', $true)
 $flags = [Reflection.BindingFlags]'Static,Public,NonPublic'
 
 function New-Provider([string] $Name) {
@@ -19,6 +20,11 @@ function New-Provider([string] $Name) {
     $provider.Status = 'ready'
     $provider.UpdatedAt = [DateTimeOffset]::UtcNow
     $provider.SourceKind = [Enum]::Parse($assembly.GetType('CodexClaudeUsage.UsageSourceKind', $true), 'CodexAppServer')
+    $tokens = [Activator]::CreateInstance($tokenType)
+    $tokens.InputTokens = 120
+    $tokens.OutputTokens = 30
+    $tokens.TotalTokens = 150
+    $provider.Tokens = $tokens
 
     $short = [Activator]::CreateInstance($bucketType)
     $short.Label = '5 hour'
@@ -43,6 +49,9 @@ if ($filtered.Codex.Buckets.Count -ne 1 -or [double]$filtered.Codex.Buckets[0].U
 }
 if ($filtered.Claude.Buckets.Count -ne 1 -or $filtered.Codex.Status -ne 'ready' -or $snapshot.Codex.Buckets.Count -ne 2) {
     throw 'Display filtering lost provider metadata or mutated the source snapshot.'
+}
+if ($filtered.Codex.Tokens.TotalTokens -ne 150 -or -not [object]::ReferenceEquals($snapshot.Codex.Tokens, $filtered.Codex.Tokens)) {
+    throw 'Total-only display filtering lost local Token usage.'
 }
 $unfiltered = $method.Invoke($null, @($snapshot, $false))
 if (-not [object]::ReferenceEquals($snapshot, $unfiltered)) {

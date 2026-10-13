@@ -54,6 +54,10 @@ namespace CodexClaudeUsage
 
         private readonly Timer _motionTimer;
         private readonly Timer _collapseTimer;
+        private readonly Timer _paintRecoveryTimer;
+        private const int PaintRecoveryCooldown = 30000;
+        private bool _paintRecoveryPending;
+        private long _lastPaintRecoveryAt = -PaintRecoveryCooldown;
         private readonly Stopwatch _motionClock;
         private readonly AnimatedNumber _codexAnimation = new AnimatedNumber(0);
         private readonly AnimatedNumber _claudeAnimation = new AnimatedNumber(0);
@@ -119,6 +123,8 @@ namespace CodexClaudeUsage
             _motionClock = Stopwatch.StartNew();
             _motionTimer = new Timer { Interval = MotionIntervalIdle };
             _motionTimer.Tick += MotionTick;
+            _paintRecoveryTimer = new Timer { Interval = 1 };
+            _paintRecoveryTimer.Tick += CompletePaintRecovery;
 
             _collapsed = !state.Pinned;
             _expandProgress = _collapsed ? 0 : 1;
@@ -354,6 +360,7 @@ namespace CodexClaudeUsage
         public event Action<Point> OpenAtRequested; // 於指定螢幕座標開啟詳細面板（液滴落點）。
         public event EventHandler RefreshRequested;   // 選單「立即更新」。
         public event EventHandler HiddenByUser;
+        public event EventHandler RecoveryRequested;
 
         protected override bool ShowWithoutActivation
         {
@@ -504,6 +511,23 @@ namespace CodexClaudeUsage
 
         private void MotionTick(object sender, EventArgs eventArgs)
         {
+            if (_paintRecoveryPending || IsDisposed || Disposing)
+            {
+                return;
+            }
+            try
+            {
+                AdvanceMotion();
+            }
+            catch (Exception exception)
+            {
+                if (!IsRecoverableDrawingException(exception)) throw;
+                SchedulePaintRecovery(exception);
+            }
+        }
+
+        private void AdvanceMotion()
+        {
             var now = _motionClock.ElapsedMilliseconds;
             var keepRunning = false;
 
@@ -600,14 +624,53 @@ namespace CodexClaudeUsage
 
         private void EnsureMotionTimer()
         {
-            if (!_motionTimer.Enabled)
+            if (!_paintRecoveryPending && !_motionTimer.Enabled)
             {
                 _motionTimer.Start();
             }
         }
 
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            if (_paintRecoveryPending || IsDisposed || Disposing)
+            {
+                return;
+            }
+            try
+            {
+                base.OnPaintBackground(e);
+            }
+            catch (Exception exception)
+            {
+                if (!IsRecoverableDrawingException(exception)) throw;
+                SchedulePaintRecovery(exception);
+            }
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
+            if (_paintRecoveryPending || IsDisposed || Disposing)
+            {
+                return;
+            }
+            try
+            {
+                PaintWidget(e);
+            }
+            catch (Exception exception)
+            {
+                if (!IsRecoverableDrawingException(exception)) throw;
+                SchedulePaintRecovery(exception);
+            }
+        }
+
+        private void PaintWidget(PaintEventArgs e)
+        {
+            // 顯示器與視窗尺寸切換時可能暫時沒有可繪區域，避免 GDI+ 例外鎖住後續繪圖。
+            if (ClientSize.Width < 2 || ClientSize.Height < 2)
+            {
+                return;
+            }
             base.OnPaint(e);
             var graphics = e.Graphics;
             graphics.SmoothingMode = SmoothingMode.AntiAlias;
@@ -650,6 +713,82 @@ namespace CodexClaudeUsage
             }
         }
 
+        private static bool IsRecoverableDrawingException(Exception exception)
+        {
+            return exception is ArgumentException
+                || exception is ExternalException
+                || exception is ObjectDisposedException;
+        }
+
+        private void SchedulePaintRecovery(Exception exception)
+        {
+            if (_paintRecoveryPending || IsDisposed || Disposing)
+            {
+                return;
+            }
+            _paintRecoveryPending = true;
+            Program.LogError(exception);
+            _motionTimer.Stop();
+            _collapseTimer.Stop();
+            _morphStarted = -1;
+            _fadeStarted = -1;
+            _usageAnimating = false;
+            _morphPumpQueued = false;
+
+            // 讓目前的 WM_PAINT 完整返回，再清理畫布與通知宿主重建。
+            var elapsed = _motionClock.ElapsedMilliseconds - _lastPaintRecoveryAt;
+            _paintRecoveryTimer.Interval = (int)Math.Max(1, PaintRecoveryCooldown - elapsed);
+            _paintRecoveryTimer.Start();
+        }
+
+        private void CompletePaintRecovery(object sender, EventArgs eventArgs)
+        {
+            _paintRecoveryTimer.Stop();
+            if (!_paintRecoveryPending || IsDisposed || Disposing)
+            {
+                return;
+            }
+            var elapsed = _motionClock.ElapsedMilliseconds - _lastPaintRecoveryAt;
+            if (elapsed < PaintRecoveryCooldown)
+            {
+                _paintRecoveryTimer.Interval = (int)(PaintRecoveryCooldown - elapsed);
+                _paintRecoveryTimer.Start();
+                return;
+            }
+            _lastPaintRecoveryAt = _motionClock.ElapsedMilliseconds;
+            try
+            {
+                EndMorphTiming();
+                EndLayeredMorph();
+                DisposeMorphSnapshots();
+            }
+            catch (Exception exception)
+            {
+                if (!IsRecoverableDrawingException(exception)) throw;
+                Program.LogError(exception);
+            }
+            _paintRecoveryPending = false;
+            var handler = RecoveryRequested;
+            if (handler != null)
+            {
+                handler(this, EventArgs.Empty);
+            }
+            if (!IsDisposed && !Disposing)
+            {
+                try
+                {
+                    ApplyScaledLayout();
+                    Opacity = RestOpacity;
+                    Invalidate();
+                }
+                catch (Exception exception)
+                {
+                    if (!IsRecoverableDrawingException(exception)) throw;
+                    SchedulePaintRecovery(exception);
+                }
+            }
+        }
+
         /// <summary>膠囊面（頂部微亮漸層）與環繞邊框；收合時即為圓面。</summary>
         private void DrawCapsuleSurface(Graphics graphics)
         {
@@ -658,6 +797,10 @@ namespace CodexClaudeUsage
 
         private void DrawCapsuleSurfaceCore(Graphics graphics, int width, int height)
         {
+            if (width < 2 || height < 2)
+            {
+                return;
+            }
             var radius = Math.Min(width, height) / 2;
             var surfaceTop = NativeVisuals.Lighten(Palette.ProviderSurface, 0.04);
             var surfaceBottom = Palette.ProviderSurface;
@@ -1148,6 +1291,7 @@ namespace CodexClaudeUsage
                 EndLayeredMorph();
                 _motionTimer.Dispose();
                 _collapseTimer.Dispose();
+                _paintRecoveryTimer.Dispose();
                 _motionClock.Stop();
                 DisposeMorphSnapshots();
                 if (_valueFont != null) _valueFont.Dispose();
@@ -1463,6 +1607,23 @@ namespace CodexClaudeUsage
         /// </summary>
         private void SetCollapsed(bool collapsed)
         {
+            if (_paintRecoveryPending || IsDisposed || Disposing)
+            {
+                return;
+            }
+            try
+            {
+                SetCollapsedCore(collapsed);
+            }
+            catch (Exception exception)
+            {
+                if (!IsRecoverableDrawingException(exception)) throw;
+                SchedulePaintRecovery(exception);
+            }
+        }
+
+        private void SetCollapsedCore(bool collapsed)
+        {
             if (_collapsed == collapsed)
             {
                 return;
@@ -1523,6 +1684,10 @@ namespace CodexClaudeUsage
                 Opacity = 1.0;
             }
             BeginLayeredMorph();
+            if (_paintRecoveryPending)
+            {
+                return;
+            }
             _morphStarted = _motionClock.ElapsedMilliseconds;
             EnsureMotionTimer();
             MotionTick(null, EventArgs.Empty); // 立即畫出第 0 幀，不等首個計時器節拍。
@@ -1581,9 +1746,11 @@ namespace CodexClaudeUsage
                 SetWindowLong(Handle, GwlExStyle, GetWindowLong(Handle, GwlExStyle) | WsExLayered);
                 _layeredMorphActive = true;
             }
-            catch
+            catch (Exception exception)
             {
                 ReleaseLayeredMorphResources();
+                if (!IsRecoverableDrawingException(exception)) throw;
+                SchedulePaintRecovery(exception);
             }
         }
 
